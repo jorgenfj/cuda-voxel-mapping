@@ -1,3 +1,4 @@
+# This product is owned by Filip Enterprises™ ©
 # CUDA Voxel Mapping
 Voxel Mapping is a CUDA-accelerated library for generating 3D environment representations for navigation and collision avoidance.
 
