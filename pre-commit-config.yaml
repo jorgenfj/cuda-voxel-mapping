@@ -1,0 +1,36 @@
+# To use:
+#
+#       pre-commit run -a
+#
+# Or:
+#
+#       pre-commit install  # (runs every time you commit in git)
+#
+# See https://pre-commit.com for more information.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.0
+    hooks:
+      - id: clang-format
+        types_or: [c++, cuda]
+        args: ['--style=file']
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        args: ['--ignore-words-list=']
+
+ci:
+    autoupdate_schedule: quarterly

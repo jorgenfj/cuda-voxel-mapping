@@ -37,6 +37,8 @@ struct VoxelMappingParams {
     VoxelType free_threshold;
     /// @brief Maximum distance for EDT computation.
     int edt_max_distance;
+    /// @brief Maximum size of the extraction buffer in bytes.
+    size_t max_extraction_buffer_size_bytes;
 };
 
 /**
