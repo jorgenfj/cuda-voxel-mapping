@@ -195,34 +195,77 @@ __global__ void update_map_from_aabb(
             active_mask &= ~processed_mask;
         }
     }
-    
-void GpuHashMap::launch_map_update_kernel(
-    AABBUpdate aabb_update,
-    cudaStream_t stream)
-    {
-        auto map_ref = d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase);
-        
-        int3 aabb_size = {
-            aabb_update.aabb_current_size.x,
-            aabb_update.aabb_current_size.y,
-            aabb_update.aabb_current_size.z
-        };
 
-        dim3 block_dim(32, 8, 1);
-        dim3 grid_dim(
-            (aabb_size.x + block_dim.x - 1) / block_dim.x,
-            (aabb_size.y + block_dim.y - 1) / block_dim.y,
-            aabb_size.z
-        );
-        
-        update_map_from_aabb<<<grid_dim, block_dim, 0, stream>>>(
-            map_ref,
-            freelist_,
-            freelist_counter_,
-            aabb_update.d_aabb_grid,
-            aabb_update.aabb_min_index,
-            aabb_size);
-        }
+std::vector<cudaGraphNode_t> GpuHashMap::add_nodes_to_insertion_graph(
+    cudaGraph_t graph,
+    const std::vector<cudaGraphNode_t>& preceding_dependencies,
+    const AABB_CUDA& aabb_update,
+    UpdateType* d_aabb_ptr)
+{
+    dim3 threads(32, 8, 1);
+    dim3 blocks(
+        (aabb_update.aabb_current_size.x + threads.x - 1) / threads.x,
+        (aabb_update.aabb_current_size.y + threads.y - 1) / threads.y,
+        aabb_update.aabb_current_size.z
+    );
+
+    ChunkMapRef map_ref = d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase);
+    insertion_kernel_args_[0] = &map_ref;
+    insertion_kernel_args_[1] = (void*)&freelist_;
+    insertion_kernel_args_[2] = (void*)&freelist_counter_;
+    insertion_kernel_args_[3] = (void*)&d_aabb_ptr;
+    insertion_kernel_args_[4] = (void*)&aabb_update.aabb_min_index;
+    insertion_kernel_args_[5] = (void*)&aabb_update.aabb_current_size;
+
+    cudaKernelNodeParams kernel_params = {0};
+    kernel_params.func = (void*)update_map_from_aabb;
+    kernel_params.gridDim = blocks;
+    kernel_params.blockDim = threads;
+    kernel_params.kernelParams = insertion_kernel_args_;
+
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &update_map_node_,
+        graph,
+        preceding_dependencies.data(),
+        preceding_dependencies.size(),
+        &kernel_params));
+
+    return {update_map_node_};
+}
+
+
+void GpuHashMap::update_insertion_graph_nodes(
+    cudaGraphExec_t executable_graph,
+    const AABB_CUDA& aabb_update,
+    UpdateType* d_aabb_ptr)
+{
+    ChunkMapRef map_ref = d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase);
+    insertion_kernel_args_[0] = &map_ref;
+
+    insertion_kernel_args_[3] = (void*)&d_aabb_ptr;
+    insertion_kernel_args_[4] = (void*)&aabb_update.aabb_min_index;
+    insertion_kernel_args_[5] = (void*)&aabb_update.aabb_current_size;
+
+    cudaKernelNodeParams kernel_params = {0};
+    kernel_params.func = (void*)update_map_from_aabb;
+
+    dim3 threads(32, 8, 1);
+    dim3 blocks(
+        (aabb_update.aabb_current_size.x + threads.x - 1) / threads.x,
+        (aabb_update.aabb_current_size.y + threads.y - 1) / threads.y,
+        aabb_update.aabb_current_size.z
+    );
+
+    kernel_params.gridDim = blocks;
+    kernel_params.blockDim = threads;
+    kernel_params.kernelParams = insertion_kernel_args_;
+
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(
+        executable_graph,
+        update_map_node_,
+        &kernel_params
+    ));
+}
 
 void GpuHashMap::clear_chunks(const int3& current_chunk_pos) {
     std::vector<ChunkKey> h_keys;

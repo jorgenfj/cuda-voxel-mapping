@@ -37,25 +37,11 @@ enum class ExtractionType {
 /**
  * @brief Represents an update to an axis-aligned bounding box (AABB) region.
  */
-struct AABBUpdate {
-    ///< Device pointer to the grid of update types for the AABB.
-    UpdateType* d_aabb_grid;
+struct AABB_CUDA {
     ///< Minimum index (corner) of the AABB in 3D grid coordinates.
     int3 aabb_min_index;
     ///< Current size of the AABB in grid units.
     int3 aabb_current_size;
-};
-
-/**
- * @brief Represents the bounds of a camera frustum in 3D space.
- */
-struct FrustumBounds {
-    ///< Minimum corner of the frustum in 3D space.
-    float3 min_frustum_corner;
-    ///< Maximum corner of the frustum in 3D space.
-    float3 max_frustum_corner;
-    ///< Maximum corner of the near plane of the frustum in 3D space.
-    float3 max_near_plane_corner;
 };
 
 /**

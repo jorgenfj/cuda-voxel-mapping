@@ -107,15 +107,6 @@ class GpuHashMap {
         GpuHashMap& operator=(GpuHashMap&&) = default;
 
         /**
-         * @brief Updates the voxel map with the given AABB update by finding or inserting the corresponding chunkptrs in the hashmap.
-         * @param aabb_update The AABB update containing the grid and its dimensions and the pointer to the AABB grid.
-         * @param stream The CUDA stream to use for the operation.
-         */
-        void launch_map_update_kernel(
-            AABBUpdate aabb_update,
-            cudaStream_t stream);
-
-        /**
          * @brief Queries the hash map for the voxels within the specified AABB and extracts them into a device memory block.
          * @tparam ExtractionTag A tag type (e.g., SliceExtractionTag, FullVolumeExtractionTag) to
          * determine how global_z is calculated.
@@ -180,6 +171,34 @@ class GpuHashMap {
             return freelist_capacity_;
         }
 
+        /**
+         * @brief Adds the map update node to the CUDA graph.
+         * This function creates a new CUDA graph node for the map update operation and adds it to the provided graph.
+         * @param graph The CUDA graph to which the node will be added.
+         * @param preceding_dependencies A vector of CUDA graph nodes that this node depends on.
+         * @param aabb_update The per-frame AABB used for kernel execution.
+         * @param d_aabb_ptr Pointer to the device memory where the AABB grid is stored
+         * @return A vector of CUDA graph nodes that were added to the graph.
+         * This vector includes the new map update node as the last dependency of the graph.
+         */
+        std::vector<cudaGraphNode_t> add_nodes_to_insertion_graph(
+            cudaGraph_t graph,
+            const std::vector<cudaGraphNode_t>& preceding_dependencies,
+            const AABB_CUDA& aabb_update,
+            UpdateType* d_aabb_ptr);
+
+        /**
+         * @brief Updates the parameters of the map update kernel node in the executable graph.
+         * @param executable_graph The executable graph to update.
+         * @param aabb_update The per-frame AABB used for kernel execution.
+         * @param d_aabb_ptr Pointer to the device memory where the AABB grid is stored.
+         */
+        void update_insertion_graph_nodes(
+            cudaGraphExec_t executable_graph,
+            const AABB_CUDA& aabb_update,
+            UpdateType* d_aabb_ptr);
+
+
     private:
         /**
          * @brief Helper function to retrieve all chunks from the hash map.
@@ -219,6 +238,9 @@ class GpuHashMap {
         uint32_t* freelist_counter_ = nullptr;
         uint32_t freelist_capacity_ = 0;
         size_t map_capacity_ = 0;
+
+        cudaGraphNode_t update_map_node_;
+        void* insertion_kernel_args_[6];
 };
 
 } // namespace voxel_mapping

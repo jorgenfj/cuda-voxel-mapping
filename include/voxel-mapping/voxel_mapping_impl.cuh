@@ -27,61 +27,63 @@ public:
     void query_free_chunk_capacity();
 
     void set_camera_properties(float fx, float fy, float cx, float cy, uint32_t width, uint32_t height);
+    
     AABB get_current_aabb() const;
+    
     Frustum get_frustum() const;
 
     template <ExtractionType Type>
     ExtractionResult extract_grid_data(const AABB& aabb, const SliceZIndices& slice_indices) {
-    ExtractionResult result;
+        ExtractionResult result;
 
-    const int aabb_size_x = aabb.size.x;
-    const int aabb_size_y = aabb.size.y;
-    
-    int num_z_layers;
-    if constexpr (Type == ExtractionType::Block) {
-        num_z_layers = aabb.size.z;
-    } else {
-        num_z_layers = slice_indices.count;
-    }
+        const int aabb_size_x = aabb.size.x;
+        const int aabb_size_y = aabb.size.y;
+        
+        int num_z_layers;
+        if constexpr (Type == ExtractionType::Block) {
+            num_z_layers = aabb.size.z;
+        } else {
+            num_z_layers = slice_indices.count;
+        }
 
-    const size_t total_elements = static_cast<size_t>(aabb_size_x) * aabb_size_y * num_z_layers;
+        const size_t total_elements = static_cast<size_t>(aabb_size_x) * aabb_size_y * num_z_layers;
 
-    if (total_elements == 0) {
+        if (total_elements == 0) {
+            return result;
+        }
+
+        auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>();
+        impl->size_bytes_ = total_elements * sizeof(VoxelType);
+
+        CHECK_CUDA_ERROR(cudaMalloc(&impl->d_data_, impl->size_bytes_));
+        CHECK_CUDA_ERROR(cudaHostAlloc(&impl->h_pinned_data_, impl->size_bytes_, cudaHostAllocDefault));
+        
+        ExtractOp extract_op = {static_cast<VoxelType*>(impl->d_data_), aabb.size.x, aabb.size.y};
+
+        {
+            std::shared_lock lock(map_mutex_);
+            voxel_map_->launch_map_extraction_kernel<Type>(
+                aabb, 
+                slice_indices, 
+                extract_op,
+                extract_stream_
+            );
+        }
+
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(
+            impl->h_pinned_data_,
+            impl->d_data_,
+            impl->size_bytes_,
+            cudaMemcpyDeviceToHost,
+            extract_stream_
+        ));
+
+        CHECK_CUDA_ERROR(cudaEventCreate(&impl->event_));
+        CHECK_CUDA_ERROR(cudaEventRecord(impl->event_, extract_stream_));
+
+        result.pimpl_ = std::move(impl);
         return result;
     }
-
-    auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>();
-    impl->size_bytes_ = total_elements * sizeof(VoxelType);
-
-    CHECK_CUDA_ERROR(cudaMalloc(&impl->d_data_, impl->size_bytes_));
-    CHECK_CUDA_ERROR(cudaHostAlloc(&impl->h_pinned_data_, impl->size_bytes_, cudaHostAllocDefault));
-    
-    ExtractOp extract_op = {static_cast<VoxelType*>(impl->d_data_), aabb.size.x, aabb.size.y};
-
-    {
-        std::shared_lock lock(map_mutex_);
-        voxel_map_->launch_map_extraction_kernel<Type>(
-            aabb, 
-            slice_indices, 
-            extract_op,
-            extract_stream_
-        );
-    }
-
-    CHECK_CUDA_ERROR(cudaMemcpyAsync(
-        impl->h_pinned_data_,
-        impl->d_data_,
-        impl->size_bytes_,
-        cudaMemcpyDeviceToHost,
-        extract_stream_
-    ));
-
-    CHECK_CUDA_ERROR(cudaEventCreate(&impl->event_));
-    CHECK_CUDA_ERROR(cudaEventRecord(impl->event_, extract_stream_));
-
-    result.pimpl_ = std::move(impl);
-    return result;
-}
 
 template <ExtractionType Type>
 ExtractionResult extract_edt_data(const AABB& aabb, const SliceZIndices& slice_indices) {
@@ -151,6 +153,7 @@ ExtractionResult extract_edt_data(const AABB& aabb, const SliceZIndices& slice_i
 }
 
 private:
+    void setup_insert_graph(const float* depth_image, const float* transform);
     float resolution_;
     int occupancy_threshold_;
     int free_threshold_;
@@ -160,6 +163,10 @@ private:
     std::unique_ptr<GpuHashMap> voxel_map_;
     std::unique_ptr<UpdateGenerator> update_generator_;
     std::unique_ptr<GridProcessor> grid_processor_;
+
+    cudaGraph_t insert_graph_ = nullptr;
+    cudaGraphExec_t insert_exec_graph_ = nullptr;
+    bool insert_graph_is_initialized_ = false;
 };
 
 }
