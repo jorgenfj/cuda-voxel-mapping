@@ -33,11 +33,11 @@ src/extraction_result.cpp
 
 if(USE_NVTX)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64") # Jetson ARM 64-bit
-    set(NVTX_LIBRARY_PATH /usr/lib/aarch64-linux-gnu/libnvToolsExt.so)
-    set(NVTX_INCLUDE_DIR /usr/include)
+    set(NVTX_LIBRARY_PATH /usr/local/cuda-12.6/targets/aarch64-linux/lib/libnvToolsExt.so)
+    set(NVTX_INCLUDE_DIR /usr/local/cuda-12.6/include)
   else() # Desktop x86_64 
-    set(NVTX_LIBRARY_PATH /usr/local/cuda-12.8/targets/x86_64-linux/lib/libnvToolsExt.so)
-    set(NVTX_INCLUDE_DIR /usr/local/cuda-12.8/include)
+    set(NVTX_LIBRARY_PATH /usr/local/cuda-12.6/targets/x86_64-linux/lib/libnvToolsExt.so)
+    set(NVTX_INCLUDE_DIR /usr/local/cuda-12.6/include)
   endif()
 
   if(EXISTS ${NVTX_LIBRARY_PATH})

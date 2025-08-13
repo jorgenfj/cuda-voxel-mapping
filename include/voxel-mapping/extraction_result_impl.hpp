@@ -23,7 +23,7 @@ public:
     ExtractionResultTyped(void* h_pinned_data, size_t size_bytes, cudaEvent_t event)
         : h_pinned_data_(h_pinned_data), size_bytes_(size_bytes), event_(event) {}
 
-    ~ExtractionResultTyped() = default;
+    ~ExtractionResultTyped() override = default; 
 
     void wait() override {
         if (event_) cudaEventSynchronize(event_);

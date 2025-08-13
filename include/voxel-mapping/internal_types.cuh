@@ -75,7 +75,7 @@ using ChunkMap = cuco::static_map<
  * @brief Type alias for a reference to a ChunkMap.
  * This reference allows for read and write operations on the ChunkMap.
  */
-using ChunkMapRef = decltype(std::declval<ChunkMap&>().ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase));
+using ChunkMapRef = decltype(std::declval<ChunkMap&>().ref(cuco::op::find, cuco::op::insert_and_find));
 
 /**
  * @brief Type alias for a constant reference to a ChunkMap.

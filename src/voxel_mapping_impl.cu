@@ -25,7 +25,6 @@ VoxelMappingImpl::VoxelMappingImpl(const VoxelMappingParams& params)
     CHECK_CUDA_ERROR(cudaMalloc(&extraction_buffer_.d_data, buffer_size));
     CHECK_CUDA_ERROR(cudaHostAlloc(&extraction_buffer_.h_pinned_data, buffer_size, cudaHostAllocDefault));
     CHECK_CUDA_ERROR(cudaEventCreate(&extraction_buffer_.event));
-    extraction_buffer_.capacity_bytes = buffer_size;
     spdlog::info("Extraction buffer preallocated with a maximum size of {} bytes", buffer_size);
 }
 
@@ -99,109 +98,74 @@ Frustum VoxelMappingImpl::get_frustum() const {
 }
 
 void VoxelMappingImpl::setup_extract_grid_block_graph() {
-    // 1. Create a placeholder AABB_CUDA and functor.
-    extraction_aabb_cuda_ = { {0, 0, 0}, {0, 0, 0} };
-    extract_op_ = { static_cast<VoxelType*>(extraction_buffer_.d_data), 0, 0 };
-
-    // 2. Create the graph
     CHECK_CUDA_ERROR(cudaGraphCreate(&extract_grid_block_graph_, 0));
 
-    // 3. Add the kernel node.
-    // The GpuHashMap::add_extraction_kernel_node function must be modified to use AABB_CUDA.
     grid_block_kernel_node_ = voxel_map_->add_extraction_kernel_node<ExtractionType::Block, ExtractOp>(
         extract_grid_block_graph_,
-        {}, // No dependencies for the first node
+        {},
         &extraction_aabb_cuda_,
         &extraction_slice_indices_,
         &extract_op_,
-        extract_stream_
+        grid_block_kernel_node_params_
     );
 
-    // 4. Add the memcpy node
-    cudaMemcpyNodeParams memcpy_params = {};
-    memcpy_params.dst = extraction_buffer_.h_pinned_data;
-    memcpy_params.src = extraction_buffer_.d_data;
-    memcpy_params.count = 0; // Placeholder size
-    memcpy_params.kind = cudaMemcpyDeviceToHost;
-    
+    cudaMemcpy3DParms memcpy3d_params = {};
+
+    size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
+
+    memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+    memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+    memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+    memcpy3d_params.kind = cudaMemcpyDeviceToHost;
+        
     CHECK_CUDA_ERROR(cudaGraphAddMemcpyNode(
         &grid_block_memcpy_node_,
         extract_grid_block_graph_,
-        &grid_block_kernel_node_, // Depends on the kernel node
+        &grid_block_kernel_node_,
         1,
-        &memcpy_params
-    ));
+        &memcpy3d_params));
 
-    // 5. Add the event record node
-    cudaEventRecordNodeParams event_params = {};
-    event_params.event = extraction_buffer_.event;
-    event_params.stream = extract_stream_;
-    
     cudaGraphNode_t event_node;
     CHECK_CUDA_ERROR(cudaGraphAddEventRecordNode(
         &event_node,
         extract_grid_block_graph_,
-        &grid_block_memcpy_node_, // Depends on the memcpy node
+        &grid_block_memcpy_node_,
         1,
-        &event_params
+        extraction_buffer_.event
     ));
-
-    // 6. Instantiate the graph
+    
     CHECK_CUDA_ERROR(cudaGraphInstantiate(&extract_grid_block_exec_graph_, extract_grid_block_graph_, nullptr, nullptr, 0));
     extract_grid_block_graph_is_initialized_ = true;
 }
 
 void VoxelMappingImpl::update_grid_block_graph_nodes() {
-    // 1. Convert user-provided AABB to the device-side struct
-    extraction_aabb_cuda_arg_.aabb_min_index = {
-        aabb.min_corner_index.x,
-        aabb.min_corner_index.y,
-        aabb.min_corner_index.z
-    };
-    extraction_aabb_cuda_arg_.aabb_current_size = {
-        aabb.size.x,
-        aabb.size.y,
-        aabb.size.z
-    };
-
-    // 2. Update kernel parameters.
-    dim3 block_dim(32, 8, 1);
-    dim3 grid_dim(
-        (aabb.size.x + block_dim.x - 1) / block_dim.x,
-        (aabb.size.y + block_dim.y - 1) / block_dim.y,
-        (aabb.size.z + block_dim.z - 1) / block_dim.z
+    voxel_map_->update_extraction_kernel_node<ExtractionType::Block, ExtractOp>(
+        extract_grid_block_exec_graph_,
+        grid_block_kernel_node_,
+        &extraction_aabb_cuda_,
+        &extraction_slice_indices_,
+        &extract_op_,
+        grid_block_kernel_node_params_
     );
 
-    cudaKernelNodeParams kernel_params = {};
-    kernel_params.func = (void*)query_map_and_process_kernel<ExtractionType::Block, ExtractOp>;
-    kernel_params.gridDim = grid_dim;
-    kernel_params.blockDim = block_dim;
-    kernel_params.sharedMemBytes = 0;
+    cudaMemcpy3DParms memcpy3d_params = {};
+    
+    size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
 
-    void* kernel_args[] = {
-        &voxel_map_->get_map_ref(), // You'll need a getter for the map reference
-        &extraction_aabb_cuda_arg_.aabb_min_index,
-        &extraction_aabb_cuda_arg_.aabb_current_size,
-        &extraction_slice_indices_arg_,
-        &grid_block_extract_op_arg_
-    };
-    kernel_params.kernelParams = kernel_args;
+    memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+    memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+    memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+    memcpy3d_params.kind = cudaMemcpyDeviceToHost;
 
-    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(extract_grid_block_exec_graph_, grid_block_kernel_node_, &kernel_params));
-
-    // 3. Update memcpy parameters.
-    const size_t size_bytes = static_cast<size_t>(aabb.size.x) * aabb.size.y * aabb.size.z * sizeof(VoxelType);
-    cudaMemcpyNodeParams memcpy_params = {};
-    memcpy_params.dst = extraction_buffer_.h_pinned_data;
-    memcpy_params.src = extraction_buffer_.d_data;
-    memcpy_params.count = size_bytes;
-    memcpy_params.kind = cudaMemcpyDeviceToHost;
-
-    CHECK_CUDA_ERROR(cudaGraphExecMemcpyNodeSetParams(extract_grid_block_exec_graph_, grid_block_memcpy_node_, &memcpy_params));
+    CHECK_CUDA_ERROR(cudaGraphExecMemcpyNodeSetParams(extract_grid_block_exec_graph_, grid_block_memcpy_node_, &memcpy3d_params));
 }
 
 ExtractionResult VoxelMappingImpl::extract_grid_block_data(const AABB& aabb) {
-    set_extraction_params(aabb, SliceZIndices{0, 0, 0}); // No slices for block extraction
+    set_extraction_params<ExtractionType::Block>(aabb, SliceZIndices{0, 0, 0});
+    if(extraction_buffer_.current_size_bytes == max_extraction_buffer_size_bytes_) {
+        spdlog::warn("Extraction buffer size ({}) is at maximum capacity. Consider increasing max_extraction_buffer_size_bytes in the config.", extraction_buffer_.current_size_bytes);
+    }
+    set_grid_block_op();
     if (!extract_grid_block_graph_is_initialized_) {
         setup_extract_grid_block_graph();
     }
@@ -210,14 +174,14 @@ ExtractionResult VoxelMappingImpl::extract_grid_block_data(const AABB& aabb) {
     
     CHECK_CUDA_ERROR(cudaGraphLaunch(extract_grid_block_exec_graph_, extract_stream_));
 
+    auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>(
+        extraction_buffer_.h_pinned_data,
+        extraction_buffer_.current_size_bytes,
+        extraction_buffer_.event
+    );
     ExtractionResult result;
-    auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>();
-    impl->h_pinned_data_ = extraction_buffer_.h_pinned_data;
-    impl->event_ = extraction_buffer_.event;
-    impl->size_bytes_ = static_cast<size_t>(aabb.size.x) * aabb.size.y * aabb.size.z * sizeof(VoxelType);
     result.pimpl_ = std::move(impl);
-    
-    return result;
+    return result;   
 }
 
 void VoxelMappingImpl::query_free_chunk_capacity() {

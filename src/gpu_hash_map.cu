@@ -20,7 +20,13 @@ static __constant__ VoxelType d_log_odds_max;
 static __constant__ VoxelType d_occupancy_threshold;
 static __constant__ VoxelType d_free_threshold;
 
-GpuHashMap::GpuHashMap(size_t capacity, VoxelType log_odds_occupied, VoxelType log_odds_free, VoxelType log_odds_min, VoxelType log_odds_max, VoxelType occupancy_threshold, VoxelType free_threshold) {
+GpuHashMap::GpuHashMap(size_t capacity, VoxelType log_odds_occupied, VoxelType log_odds_free, VoxelType log_odds_min, VoxelType log_odds_max, VoxelType occupancy_threshold, VoxelType free_threshold) 
+    : freelist_capacity_(capacity),
+      map_capacity_(static_cast<size_t>(static_cast<double>(capacity) / 0.9)),
+      d_voxel_map_(create_chunk_map(map_capacity_)),
+      map_ref_extraction_(d_voxel_map_->ref(cuco::op::find)),
+      map_ref_insertion_(d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find))
+{
     if (capacity == 0) {
         spdlog::error("Capacity must be greater than zero.");
         throw std::invalid_argument("Capacity must be greater than zero.");
@@ -29,21 +35,6 @@ GpuHashMap::GpuHashMap(size_t capacity, VoxelType log_odds_occupied, VoxelType l
         spdlog::error("Capacity exceeds the limit of the internal counter.");
         throw std::invalid_argument("Capacity exceeds the limit of the internal counter.");
     }
-
-    freelist_capacity_ = capacity;
-
-    map_capacity_ = static_cast<size_t>(static_cast<double>(freelist_capacity_) / 0.9);
-
-    ChunkKey empty_key_sentinel = std::numeric_limits<ChunkKey>::max();
-    ChunkKey erased_key_sentinel = std::numeric_limits<ChunkKey>::max() - 1;
-    ChunkPtr empty_value_sentinel = nullptr;
-
-    d_voxel_map_ = std::make_unique<ChunkMap>(
-        map_capacity_,
-        cuco::empty_key{empty_key_sentinel},
-        cuco::empty_value{empty_value_sentinel},
-        cuco::erased_key{erased_key_sentinel}
-    );
 
     size_t chunk_size_elements = chunk_dim() * chunk_dim() * chunk_dim();
     size_t chunk_size_bytes = sizeof(VoxelType) * chunk_size_elements;
@@ -85,6 +76,19 @@ GpuHashMap::GpuHashMap(size_t capacity, VoxelType log_odds_occupied, VoxelType l
 }
 
 GpuHashMap::~GpuHashMap() = default;
+
+std::unique_ptr<ChunkMap> GpuHashMap::create_chunk_map(size_t capacity) {
+    ChunkKey empty_key_sentinel = std::numeric_limits<ChunkKey>::max();
+    ChunkKey erased_key_sentinel = std::numeric_limits<ChunkKey>::max() - 1;
+    ChunkPtr empty_value_sentinel = nullptr;
+
+    return std::make_unique<ChunkMap>(
+        capacity,
+        cuco::empty_key{empty_key_sentinel},
+        cuco::empty_value{empty_value_sentinel},
+        cuco::erased_key{erased_key_sentinel}
+    );
+}
 
 void GpuHashMap::get_freelist_counter(uint32_t* freelist_counter) {
     CHECK_CUDA_ERROR(cudaMemcpy(freelist_counter, freelist_counter_, sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -203,14 +207,13 @@ std::vector<cudaGraphNode_t> GpuHashMap::add_nodes_to_insertion_graph(
     UpdateType* d_aabb_ptr)
 {
     dim3 threads(32, 8, 1);
-    dim3 blocks(
+    dim3 blocks(    
         (aabb_update.aabb_current_size.x + threads.x - 1) / threads.x,
         (aabb_update.aabb_current_size.y + threads.y - 1) / threads.y,
         aabb_update.aabb_current_size.z
     );
 
-    ChunkMapRef map_ref = d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase);
-    insertion_kernel_args_[0] = &map_ref;
+    insertion_kernel_args_[0] = &map_ref_insertion_;
     insertion_kernel_args_[1] = (void*)&freelist_;
     insertion_kernel_args_[2] = (void*)&freelist_counter_;
     insertion_kernel_args_[3] = (void*)&d_aabb_ptr;
@@ -239,9 +242,7 @@ void GpuHashMap::update_insertion_graph_nodes(
     const AABB_CUDA& aabb_update,
     UpdateType* d_aabb_ptr)
 {
-    ChunkMapRef map_ref = d_voxel_map_->ref(cuco::op::find, cuco::op::insert_and_find, cuco::op::erase);
-    insertion_kernel_args_[0] = &map_ref;
-
+    insertion_kernel_args_[0] = &map_ref_insertion_;
     insertion_kernel_args_[3] = (void*)&d_aabb_ptr;
     insertion_kernel_args_[4] = (void*)&aabb_update.aabb_min_index;
     insertion_kernel_args_[5] = (void*)&aabb_update.aabb_current_size;
