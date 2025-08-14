@@ -24,11 +24,11 @@ ExtractionResult VoxelMapping::extract_grid_slices(const AABB& aabb, const Slice
 }
 
 ExtractionResult VoxelMapping::extract_edt_block(const AABB& aabb) {
-    // return pimpl_->extract_edt_data<ExtractionType::Block>(aabb, SliceZIndices{});
+    return pimpl_->extract_edt_block(aabb);
 }
 
 ExtractionResult VoxelMapping::extract_edt_slices(const AABB& aabb, const SliceZIndices& slice_indices) {
-    // return pimpl_->extract_edt_data<ExtractionType::Slice>(aabb, slice_indices);
+    return pimpl_->extract_edt_slices(aabb, slice_indices);
 }
 
 void VoxelMapping::query_free_chunk_capacity() {

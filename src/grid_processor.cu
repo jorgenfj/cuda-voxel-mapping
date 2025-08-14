@@ -103,5 +103,167 @@ void GridProcessor::launch_3d_edt_kernels(int* d_grid, int size_x, int size_y, i
     launch_edt_kernels_internal<ExtractionType::Block>(d_grid, size_x, size_y, size_z, stream);
 }
 
+cudaGraphNode_t GridProcessor::add_edt_slice_nodes(
+    cudaGraph_t graph,
+    const std::vector<cudaGraphNode_t>& dependencies,
+    int* d_grid_ptr,
+    int size_x,
+    int size_y,
+    int size_z) {
+    
+    int* d_grid_ptr_ = d_grid_ptr;
+    int size_x_ = size_x;
+    int size_y_ = size_y;
+    int size_z_ = size_z;
+
+    void* kernel_args_x_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_y_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+
+    cudaKernelNodeParams x_params = {};
+    x_params.func = (void*)edt_1d_pass_kernel<Dimension::X>;
+    x_params.gridDim = dim3(size_y, size_z);
+    x_params.blockDim = dim3(256);
+    x_params.sharedMemBytes = size_x * sizeof(int);
+    x_params.kernelParams = kernel_args_x_;
+    
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &edt_slice_x_node_, graph, dependencies.data(), dependencies.size(), &x_params));
+
+    cudaKernelNodeParams y_params = {};
+    y_params.func = (void*)edt_1d_pass_kernel<Dimension::Y>;
+    y_params.gridDim = dim3(size_x, size_z);
+    y_params.blockDim = dim3(256);
+    y_params.sharedMemBytes = size_y * sizeof(int);
+    y_params.kernelParams = kernel_args_y_;
+    
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &edt_slice_y_node_, graph, &edt_slice_x_node_, 1, &y_params));
+    return edt_slice_y_node_;
+}
+
+void GridProcessor::update_edt_slice_nodes(
+    cudaGraphExec_t exec_graph,
+    int* d_grid_ptr,
+    int size_x,
+    int size_y,
+    int size_z) {
+
+    int* d_grid_ptr_ = d_grid_ptr;
+    int size_x_ = size_x;
+    int size_y_ = size_y;
+    int size_z_ = size_z;
+
+    void* kernel_args_x_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_y_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+
+    cudaKernelNodeParams x_params = {};
+    x_params.func = (void*)edt_1d_pass_kernel<Dimension::X>;
+    x_params.gridDim = dim3(size_y, size_z);
+    x_params.blockDim = dim3(256);
+    x_params.sharedMemBytes = size_x * sizeof(int);
+    x_params.kernelParams = kernel_args_x_;
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, edt_slice_x_node_, &x_params));
+
+    cudaKernelNodeParams y_params = {};
+    y_params.func = (void*)edt_1d_pass_kernel<Dimension::Y>;
+    y_params.gridDim = dim3(size_x, size_z);
+    y_params.blockDim = dim3(256);
+    y_params.sharedMemBytes = size_y * sizeof(int);
+    y_params.kernelParams = kernel_args_y_;
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, edt_slice_y_node_, &y_params));
+}
+
+cudaGraphNode_t GridProcessor::add_edt_block_nodes(
+    cudaGraph_t graph,
+    const std::vector<cudaGraphNode_t>& dependencies,
+    int* d_grid_ptr,
+    int size_x,
+    int size_y,
+    int size_z) {
+
+    int* d_grid_ptr_ = d_grid_ptr;
+    int size_x_ = size_x;
+    int size_y_ = size_y;
+    int size_z_ = size_z;
+
+    void* kernel_args_x_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_y_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_z_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+
+    cudaKernelNodeParams x_params = {};
+    x_params.func = (void*)edt_1d_pass_kernel<Dimension::X>;
+    x_params.gridDim = dim3(size_y, size_z);
+    x_params.blockDim = dim3(256);
+    x_params.sharedMemBytes = size_x * sizeof(int);
+    x_params.kernelParams = kernel_args_x_;
+    
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &edt_block_x_node_, graph, dependencies.data(), dependencies.size(), &x_params));
+
+    cudaKernelNodeParams y_params = {};
+    y_params.func = (void*)edt_1d_pass_kernel<Dimension::Y>;
+    y_params.gridDim = dim3(size_x, size_z);
+    y_params.blockDim = dim3(256);
+    y_params.sharedMemBytes = size_y * sizeof(int);
+    y_params.kernelParams = kernel_args_y_;
+    
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &edt_block_y_node_, graph, &edt_block_x_node_, 1, &y_params));
+
+    cudaKernelNodeParams z_params = {};
+    z_params.func = (void*)edt_1d_pass_kernel<Dimension::Z>;
+    z_params.gridDim = dim3(size_x, size_y);
+    z_params.blockDim = dim3(256);
+    z_params.sharedMemBytes = size_z * sizeof(int);
+    z_params.kernelParams = kernel_args_z_;
+
+    CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+        &edt_block_z_node_, graph, &edt_block_y_node_, 1, &z_params));
+
+    return edt_block_z_node_;
+}
+
+void GridProcessor::update_edt_block_nodes(
+    cudaGraphExec_t exec_graph,
+    int* d_grid_ptr,
+    int size_x,
+    int size_y,
+    int size_z) {
+
+    int* d_grid_ptr_ = d_grid_ptr;
+    int size_x_ = size_x;
+    int size_y_ = size_y;
+    int size_z_ = size_z;
+
+    void* kernel_args_x_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_y_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+    void* kernel_args_z_[5] = {&d_grid_ptr_, &d_grid_ptr_, &size_x_, &size_y_, &size_z_};
+
+    cudaKernelNodeParams x_params = {};
+    x_params.func = (void*)edt_1d_pass_kernel<Dimension::X>;
+    x_params.gridDim = dim3(size_y, size_z);
+    x_params.blockDim = dim3(256);
+    x_params.sharedMemBytes = size_x * sizeof(int);
+    x_params.kernelParams = kernel_args_x_;
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, edt_block_x_node_, &x_params));
+
+    cudaKernelNodeParams y_params = {};
+    y_params.func = (void*)edt_1d_pass_kernel<Dimension::Y>;
+    y_params.gridDim = dim3(size_x, size_z);
+    y_params.blockDim = dim3(256);
+    y_params.sharedMemBytes = size_y * sizeof(int);
+    y_params.kernelParams = kernel_args_y_;
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, edt_block_y_node_, &y_params));
+
+    cudaKernelNodeParams z_params = {};
+    z_params.func = (void*)edt_1d_pass_kernel<Dimension::Z>;
+    z_params.gridDim = dim3(size_x, size_y);
+    z_params.blockDim = dim3(256);
+    z_params.sharedMemBytes = size_z * sizeof(int);
+    z_params.kernelParams = kernel_args_z_;
+    
+    CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, edt_block_z_node_, &z_params));
+}
+
 } // namespace voxel_mapping
 

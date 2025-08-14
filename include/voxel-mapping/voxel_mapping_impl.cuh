@@ -48,7 +48,7 @@ public:
     template <ExtractionType Type>
     ExtractionResult extract_grid_data(const AABB& aabb, const SliceZIndices& slice_indices) {
         set_extraction_params<Type>(aabb, slice_indices);
-        if(extraction_buffer_.current_size_bytes == max_extraction_buffer_size_bytes_) {
+        if (extraction_buffer_.current_size_bytes == max_extraction_buffer_size_bytes_) {
             spdlog::warn("Extraction buffer size ({}) is at maximum capacity. Consider increasing max_extraction_buffer_size_bytes in the config.", extraction_buffer_.current_size_bytes);
         }
         extract_op_ = {static_cast<VoxelType*>(extraction_buffer_.d_data), extraction_aabb_cuda_.aabb_current_size.x, extraction_aabb_cuda_.aabb_current_size.y};
@@ -68,6 +68,66 @@ public:
         ExtractionResult result;
         result.pimpl_ = std::move(impl);
         return result;   
+    }
+
+    ExtractionResult extract_edt_slices(
+        const AABB& aabb,
+        const SliceZIndices& slice_indices) {
+        set_extraction_params<ExtractionType::Slice>(aabb, slice_indices);
+        int max_dim_sq = std::max(aabb.size.x, aabb.size.y);
+        max_dim_sq *= max_dim_sq;
+        extract_binary_op_ = {
+            static_cast<VoxelType*>(extraction_buffer_.d_data),
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            free_threshold_,
+            max_dim_sq
+        };
+        if (!extract_edt_slice_graph_is_initialized_) {
+            setup_extract_edt_slice_graph();
+        }
+
+        update_edt_slice_graph_nodes();
+
+        CHECK_CUDA_ERROR(cudaGraphLaunch(extract_edt_slice_exec_graph_, extract_stream_));
+
+        auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>(
+            extraction_buffer_.h_pinned_data,
+            extraction_buffer_.current_size_bytes,
+            extraction_buffer_.event
+        );
+        ExtractionResult result;
+        result.pimpl_ = std::move(impl);
+        return result;
+    }
+
+    ExtractionResult extract_edt_block(const AABB& aabb) {
+        set_extraction_params<ExtractionType::Block>(aabb, SliceZIndices{});
+        int max_dim_sq = std::max({aabb.size.x, aabb.size.y, aabb.size.z});
+        max_dim_sq *= max_dim_sq;
+        extract_binary_op_ = {
+            static_cast<VoxelType*>(extraction_buffer_.d_data),
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            free_threshold_,
+            max_dim_sq
+        };
+        if (!extract_edt_block_graph_is_initialized_) {
+            setup_extract_edt_block_graph();
+        }
+
+        update_edt_block_nodes();
+
+        CHECK_CUDA_ERROR(cudaGraphLaunch(extract_edt_block_exec_graph_, extract_stream_));
+
+        auto impl = std::make_unique<ExtractionResultTyped<VoxelType>>(
+            extraction_buffer_.h_pinned_data,
+            extraction_buffer_.current_size_bytes,
+            extraction_buffer_.event
+        );
+        ExtractionResult result;
+        result.pimpl_ = std::move(impl);
+        return result;
     }
     
 private:
@@ -162,6 +222,166 @@ private:
         CHECK_CUDA_ERROR(cudaGraphExecMemcpyNodeSetParams(extract_grid_exec_graph_, extract_grid_memcpy_node_, &memcpy3d_params));
     }
 
+    void setup_extract_edt_slice_graph() {
+        CHECK_CUDA_ERROR(cudaGraphCreate(&extract_edt_slice_graph_, 0));
+
+        extract_edt_slice_kernel_node_ = voxel_map_->add_extraction_kernel_node<ExtractionType::Slice, ExtractBinaryOp>(
+            extract_edt_slice_graph_,
+            {},
+            &extraction_aabb_cuda_,
+            &extraction_slice_indices_,
+            &extract_binary_op_,
+            extract_edt_slice_kernel_node_params_
+        );
+
+        cudaGraphNode_t edt_slice_node = grid_processor_->add_edt_slice_nodes(
+            extract_edt_slice_graph_,
+            {extract_edt_slice_kernel_node_},
+            (int *)extraction_buffer_.d_data,
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            extraction_slice_indices_.count
+        );
+
+        cudaMemcpy3DParms memcpy3d_params = {};
+
+        size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
+
+        memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+        memcpy3d_params.kind = cudaMemcpyDeviceToHost;
+            
+        CHECK_CUDA_ERROR(cudaGraphAddMemcpyNode(
+            &extract_edt_slice_memcpy_node_,
+            extract_edt_slice_graph_,
+            &edt_slice_node,
+            1,
+            &memcpy3d_params));
+
+        cudaGraphNode_t event_node;
+        CHECK_CUDA_ERROR(cudaGraphAddEventRecordNode(
+            &event_node,
+            extract_edt_slice_graph_,
+            &extract_edt_slice_memcpy_node_,
+            1,
+            extraction_buffer_.event
+        ));
+
+        CHECK_CUDA_ERROR(cudaGraphInstantiate(&extract_edt_slice_exec_graph_, extract_edt_slice_graph_, nullptr, nullptr, 0));
+        extract_edt_slice_graph_is_initialized_ = true;
+    }
+
+    void update_edt_slice_graph_nodes() {
+        voxel_map_->update_extraction_kernel_node<ExtractionType::Slice, ExtractBinaryOp>(
+            extract_edt_slice_exec_graph_,
+            extract_edt_slice_kernel_node_,
+            &extraction_aabb_cuda_,
+            &extraction_slice_indices_,
+            &extract_binary_op_,
+            extract_edt_slice_kernel_node_params_
+        );
+
+        grid_processor_->update_edt_slice_nodes(
+            extract_edt_slice_exec_graph_,
+            (int *)extraction_buffer_.d_data,
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            extraction_slice_indices_.count
+        );
+
+        cudaMemcpy3DParms memcpy3d_params = {};
+        
+        size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
+
+        memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+        memcpy3d_params.kind = cudaMemcpyDeviceToHost;
+
+        CHECK_CUDA_ERROR(cudaGraphExecMemcpyNodeSetParams(extract_edt_slice_exec_graph_, extract_edt_slice_memcpy_node_, &memcpy3d_params));
+    }
+
+    void setup_extract_edt_block_graph() {
+        CHECK_CUDA_ERROR(cudaGraphCreate(&extract_edt_block_graph_, 0));
+
+        extract_edt_block_kernel_node_ = voxel_map_->add_extraction_kernel_node<ExtractionType::Block, ExtractBinaryOp>(
+            extract_edt_block_graph_,
+            {},
+            &extraction_aabb_cuda_,
+            &extraction_slice_indices_,
+            &extract_binary_op_,
+            extract_edt_block_kernel_node_params_
+        );
+
+        cudaGraphNode_t edt_block_node = grid_processor_->add_edt_block_nodes(
+            extract_edt_block_graph_,
+            {extract_edt_block_kernel_node_},
+            (int *)extraction_buffer_.d_data,
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            extraction_aabb_cuda_.aabb_current_size.z
+        );
+
+        cudaMemcpy3DParms memcpy3d_params = {};
+
+        size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
+
+        memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+        memcpy3d_params.kind = cudaMemcpyDeviceToHost;
+            
+        CHECK_CUDA_ERROR(cudaGraphAddMemcpyNode(
+            &extract_edt_block_memcpy_node_,
+            extract_edt_block_graph_,
+            &edt_block_node,
+            1,
+            &memcpy3d_params));
+
+        cudaGraphNode_t event_node;
+        CHECK_CUDA_ERROR(cudaGraphAddEventRecordNode(
+            &event_node,
+            extract_edt_block_graph_,
+            &extract_edt_block_memcpy_node_,
+            1,
+            extraction_buffer_.event
+        ));
+
+        CHECK_CUDA_ERROR(cudaGraphInstantiate(&extract_edt_block_exec_graph_, extract_edt_block_graph_, nullptr, nullptr, 0));
+        extract_edt_block_graph_is_initialized_ = true;
+    }
+
+    void update_edt_block_nodes() {
+        voxel_map_->update_extraction_kernel_node<ExtractionType::Block, ExtractBinaryOp>(
+            extract_edt_block_exec_graph_,
+            extract_edt_block_kernel_node_,
+            &extraction_aabb_cuda_,
+            &extraction_slice_indices_,
+            &extract_binary_op_,
+            extract_edt_block_kernel_node_params_
+        );
+
+        grid_processor_->update_edt_block_nodes(
+            extract_edt_block_exec_graph_,
+            (int *)extraction_buffer_.d_data,
+            extraction_aabb_cuda_.aabb_current_size.x,
+            extraction_aabb_cuda_.aabb_current_size.y,
+            extraction_aabb_cuda_.aabb_current_size.z
+        );
+
+        cudaMemcpy3DParms memcpy3d_params = {};
+        
+        size_t total_copy_bytes = extraction_buffer_.current_size_bytes;
+
+        memcpy3d_params.srcPtr = make_cudaPitchedPtr(extraction_buffer_.d_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.dstPtr = make_cudaPitchedPtr(extraction_buffer_.h_pinned_data, total_copy_bytes, total_copy_bytes, 1);
+        memcpy3d_params.extent = make_cudaExtent(total_copy_bytes, 1, 1);
+        memcpy3d_params.kind = cudaMemcpyDeviceToHost;
+
+        CHECK_CUDA_ERROR(cudaGraphExecMemcpyNodeSetParams(extract_edt_block_exec_graph_, extract_edt_block_memcpy_node_, &memcpy3d_params));
+    }
+
     void setup_insert_graph(const float* depth_image, const float* transform);
     float resolution_;
     int occupancy_threshold_;
@@ -198,9 +418,19 @@ private:
     cudaGraphExec_t extract_edt_block_exec_graph_ = nullptr;
     bool extract_edt_block_graph_is_initialized_ = false;
 
+    cudaGraphNode_t extract_edt_block_kernel_node_;
+    cudaGraphNode_t extract_edt_block_memcpy_node_;
+    cudaGraphNode_t extract_edt_slice_kernel_node_;
+    cudaGraphNode_t extract_edt_slice_memcpy_node_;
+
+    void* extract_edt_block_kernel_node_params_[5];
+    void* extract_edt_slice_kernel_node_params_[5];
+
     AABB_CUDA extraction_aabb_cuda_;
     SliceZIndices extraction_slice_indices_;
     ExtractOp extract_op_;
+    ExtractBinaryOp extract_binary_op_;
+
 };
 
 }
