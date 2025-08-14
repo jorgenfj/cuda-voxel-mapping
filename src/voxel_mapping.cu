@@ -16,11 +16,11 @@ void VoxelMapping::integrate_depth(const float* depth_image, const float* transf
 }
 
 ExtractionResult VoxelMapping::extract_grid_block(const AABB& aabb) {
-    return pimpl_->extract_grid_block_data(aabb);
+    return pimpl_->extract_grid_data<ExtractionType::Block>(aabb, SliceZIndices{});
 }
 
 ExtractionResult VoxelMapping::extract_grid_slices(const AABB& aabb, const SliceZIndices& slice_indices) {
-    // return pimpl_->extract_grid_data<ExtractionType::Slice>(aabb, slice_indices);
+    return pimpl_->extract_grid_data<ExtractionType::Slice>(aabb, slice_indices);
 }
 
 ExtractionResult VoxelMapping::extract_edt_block(const AABB& aabb) {

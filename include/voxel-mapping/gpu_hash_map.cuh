@@ -128,11 +128,21 @@ class GpuHashMap {
             void** kernel_args) {
 
             dim3 block_dim(32, 8, 1);
-            dim3 grid_dim(
-                (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
-                (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
-                (aabb_cuda_ptr->aabb_current_size.z + block_dim.z - 1) / block_dim.z
-            );
+
+            dim3 grid_dim;
+            if constexpr (Tag == ExtractionType::Block) {
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    aabb_cuda_ptr->aabb_current_size.z
+                );
+            } else { // ExtractionType::Slice
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    slice_indices_ptr->count
+                );
+            }
 
             cudaKernelNodeParams kernel_params = {};
             kernel_params.func = (void*)extract_from_map<Tag, Functor>;
@@ -180,11 +190,20 @@ class GpuHashMap {
             void** kernel_args) {
 
             dim3 block_dim(32, 8, 1);
-            dim3 grid_dim(
-                (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
-                (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
-                (aabb_cuda_ptr->aabb_current_size.z + block_dim.z - 1) / block_dim.z
-            );
+            dim3 grid_dim;
+            if constexpr (Tag == ExtractionType::Block) {
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    aabb_cuda_ptr->aabb_current_size.z
+                );
+            } else { // ExtractionType::Slice
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    slice_indices_ptr->count
+                );
+            }
 
             cudaKernelNodeParams kernel_params = {};
             kernel_params.func = (void*)extract_from_map<Tag, Functor>;
@@ -201,49 +220,6 @@ class GpuHashMap {
             kernel_params.kernelParams = kernel_args;
 
             CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, kernel_node, &kernel_params));
-        }
-
-
-        /**
-         * @brief Queries the hash map for the voxels within the specified AABB and extracts them into a device memory block.
-         * @tparam ExtractionTag A tag type (e.g., SliceExtractionTag, FullVolumeExtractionTag) to
-         * determine how global_z is calculated.
-         * @tparam Functor A callable type (e.g., a lambda) that processes the retrieved voxel value.
-         * @param d_output_buffer Pointer to the output buffer where the extracted voxels will be stored.
-         * @param aabb The AABB defining the region to extract (size.z used only with BlockExtractionTag).
-         * @param z_indices A struct containing an array of Z indices and their count (used only with SliceExtractionTag).
-         * @param extract_op The callable object to execute for each voxel. It is passed the VoxelType and the
-         * local coordinates (aabb_x, aabb_y, aabb_z) to write the result to the output.
-         */
-        template <ExtractionType Tag, typename Functor>
-        void launch_map_extraction_kernel(const AABB& aabb, const SliceZIndices& slice_indices, Functor&& extract_op, cudaStream_t stream) {
-            int3 aabb_min_index = {
-                aabb.min_corner_index.x,
-                aabb.min_corner_index.y,
-                aabb.min_corner_index.z
-            };
-            int3 aabb_size = {
-                aabb.size.x,
-                aabb.size.y,
-                aabb.size.z
-            };
-            
-            dim3 block_dim(32, 8, 1);
-            dim3 grid_dim(
-                (aabb_size.x + block_dim.x - 1) / block_dim.x,
-                (aabb_size.y + block_dim.y - 1) / block_dim.y,
-                (aabb_size.z + block_dim.z - 1) / block_dim.z
-            );
-
-            auto map_ref = d_voxel_map_->ref(cuco::op::find);
-
-            extract_from_map<Tag><<<grid_dim, block_dim, 0, stream>>>(
-                map_ref,
-                aabb_min_index,
-                aabb_size,
-                slice_indices,
-                extract_op
-            );
         }
 
         /**
