@@ -3,6 +3,7 @@
 
 #include <cuco/static_map.cuh>
 #include <voxel-mapping/types.hpp>
+#include <voxel-mapping/host_macros.hpp>
 #include "voxel-mapping/internal_types.cuh"
 #include "voxel-mapping/map_utils.cuh"
 #include <memory>
@@ -21,7 +22,7 @@ namespace voxel_mapping {
  * @param op The callable object to execute for each voxel. It is passed the VoxelType and the
  * local coordinates (aabb_x, aabb_y, aabb_z) to write the result to the output.
  */
-template <ExtractionType Tag, typename Functor> __global__ void query_map_and_process_kernel(
+template <ExtractionType Tag, typename Functor> __global__ void extract_from_map(
     ConstChunkMapRef map_ref,
     int3 aabb_min_index,
     int3 aabb_size,
@@ -107,54 +108,118 @@ class GpuHashMap {
         GpuHashMap& operator=(GpuHashMap&&) = default;
 
         /**
-         * @brief Updates the voxel map with the given AABB update by finding or inserting the corresponding chunkptrs in the hashmap.
-         * @param aabb_update The AABB update containing the grid and its dimensions and the pointer to the AABB grid.
-         * @param stream The CUDA stream to use for the operation.
-         */
-        void launch_map_update_kernel(
-            AABBUpdate aabb_update,
-            cudaStream_t stream);
-
-        /**
-         * @brief Queries the hash map for the voxels within the specified AABB and extracts them into a device memory block.
-         * @tparam ExtractionTag A tag type (e.g., SliceExtractionTag, FullVolumeExtractionTag) to
-         * determine how global_z is calculated.
-         * @tparam Functor A callable type (e.g., a lambda) that processes the retrieved voxel value.
-         * @param d_output_buffer Pointer to the output buffer where the extracted voxels will be stored.
-         * @param aabb The AABB defining the region to extract (size.z used only with BlockExtractionTag).
-         * @param z_indices A struct containing an array of Z indices and their count (used only with SliceExtractionTag).
-         * @param extract_op The callable object to execute for each voxel. It is passed the VoxelType and the
-         * local coordinates (aabb_x, aabb_y, aabb_z) to write the result to the output.
+         * @brief Creates a kernel node for extraction and adds it to a CUDA graph.
+         * @tparam Tag The extraction type (Block or Slice).
+         * @tparam Functor The functor type used for processing the voxels.
+         * @param graph The CUDA graph to add the node to.
+         * @param dependencies An optional vector of nodes that this node depends on.
+         * @param aabb_placeholder A placeholder AABB for graph creation.
+         * @param slice_indices_placeholder A placeholder SliceZIndices for graph creation.
+         * @param extract_op_placeholder A placeholder functor for graph creation.
+         * @return The handle to the created kernel node.
          */
         template <ExtractionType Tag, typename Functor>
-        void launch_map_extraction_kernel(const AABB& aabb, const SliceZIndices& slice_indices, Functor&& extract_op, cudaStream_t stream) {
-            int3 aabb_min_index = {
-                aabb.min_corner_index.x,
-                aabb.min_corner_index.y,
-                aabb.min_corner_index.z
-            };
-            int3 aabb_size = {
-                aabb.size.x,
-                aabb.size.y,
-                aabb.size.z
-            };
-            
+        cudaGraphNode_t add_extraction_kernel_node(
+            cudaGraph_t graph,
+            const std::vector<cudaGraphNode_t>& dependencies,
+            const AABB_CUDA* aabb_cuda_ptr,
+            const SliceZIndices* slice_indices_ptr,
+            Functor* extract_op_ptr,
+            void** kernel_args) {
+
             dim3 block_dim(32, 8, 1);
-            dim3 grid_dim(
-                (aabb_size.x + block_dim.x - 1) / block_dim.x,
-                (aabb_size.y + block_dim.y - 1) / block_dim.y,
-                (aabb_size.z + block_dim.z - 1) / block_dim.z
-            );
 
-            auto map_ref = d_voxel_map_->ref(cuco::op::find);
+            dim3 grid_dim;
+            if constexpr (Tag == ExtractionType::Block) {
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    aabb_cuda_ptr->aabb_current_size.z
+                );
+            } else { // ExtractionType::Slice
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    slice_indices_ptr->count
+                );
+            }
 
-            query_map_and_process_kernel<Tag><<<grid_dim, block_dim, 0, stream>>>(
-                map_ref,
-                aabb_min_index,
-                aabb_size,
-                slice_indices,
-                extract_op
-            );
+            cudaKernelNodeParams kernel_params = {};
+            kernel_params.func = (void*)extract_from_map<Tag, Functor>;
+            kernel_params.gridDim = grid_dim;
+            kernel_params.blockDim = block_dim;
+            kernel_params.sharedMemBytes = 0;
+
+            kernel_args[0] = &map_ref_extraction_;
+            kernel_args[1] = (void*)&aabb_cuda_ptr->aabb_min_index;
+            kernel_args[2] = (void*)&aabb_cuda_ptr->aabb_current_size;
+            kernel_args[3] = (void*)slice_indices_ptr;
+            kernel_args[4] = (void*)extract_op_ptr;
+
+            kernel_params.kernelParams = kernel_args;
+
+            cudaGraphNode_t kernel_node;
+            CHECK_CUDA_ERROR(cudaGraphAddKernelNode(
+                &kernel_node,
+                graph,
+                dependencies.data(),
+                dependencies.size(),
+                &kernel_params
+            ));
+
+            return kernel_node;
+        }
+
+        /**
+         * @brief Updates the kernel parameters for an extraction kernel node.
+         * @tparam Tag The extraction type (Block or Slice).
+         * @tparam Functor The functor type used for processing the voxels.
+         * @param exec_graph The executable graph containing the node.
+         * @param kernel_node The handle to the kernel node to update.
+         * @param aabb_cuda_ptr Pointer to the updated AABB_CUDA struct.
+         * @param slice_indices_ptr Pointer to the updated SliceZIndices struct.
+         * @param extract_op_ptr Pointer to the updated functor.
+         */
+        template <ExtractionType Tag, typename Functor>
+        void update_extraction_kernel_node(
+            cudaGraphExec_t exec_graph,
+            cudaGraphNode_t kernel_node,
+            const AABB_CUDA* aabb_cuda_ptr,
+            const SliceZIndices* slice_indices_ptr,
+            Functor* extract_op_ptr,
+            void** kernel_args) {
+
+            dim3 block_dim(32, 8, 1);
+            dim3 grid_dim;
+            if constexpr (Tag == ExtractionType::Block) {
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    aabb_cuda_ptr->aabb_current_size.z
+                );
+            } else { // ExtractionType::Slice
+                grid_dim = dim3(
+                    (aabb_cuda_ptr->aabb_current_size.x + block_dim.x - 1) / block_dim.x,
+                    (aabb_cuda_ptr->aabb_current_size.y + block_dim.y - 1) / block_dim.y,
+                    slice_indices_ptr->count
+                );
+            }
+
+            cudaKernelNodeParams kernel_params = {};
+            kernel_params.func = (void*)extract_from_map<Tag, Functor>;
+            kernel_params.gridDim = grid_dim;
+            kernel_params.blockDim = block_dim;
+            kernel_params.sharedMemBytes = 0;
+
+            kernel_args[0] = &map_ref_extraction_;
+            kernel_args[1] = (void*)&aabb_cuda_ptr->aabb_min_index;
+            kernel_args[2] = (void*)&aabb_cuda_ptr->aabb_current_size;
+            kernel_args[3] = (void*)slice_indices_ptr;
+            kernel_args[4] = (void*)extract_op_ptr;
+
+            kernel_params.kernelParams = kernel_args;
+
+            CHECK_CUDA_ERROR(cudaGraphExecKernelNodeSetParams(exec_graph, kernel_node, &kernel_params));
         }
 
         /**
@@ -180,7 +245,43 @@ class GpuHashMap {
             return freelist_capacity_;
         }
 
+        /**
+         * @brief Adds the map update node to the CUDA graph.
+         * This function creates a new CUDA graph node for the map update operation and adds it to the provided graph.
+         * @param graph The CUDA graph to which the node will be added.
+         * @param preceding_dependencies A vector of CUDA graph nodes that this node depends on.
+         * @param aabb_update The per-frame AABB used for kernel execution.
+         * @param d_aabb_ptr Pointer to the device memory where the AABB grid is stored
+         * @return A vector of CUDA graph nodes that were added to the graph.
+         * This vector includes the new map update node as the last dependency of the graph.
+         */
+        std::vector<cudaGraphNode_t> add_nodes_to_insertion_graph(
+            cudaGraph_t graph,
+            const std::vector<cudaGraphNode_t>& preceding_dependencies,
+            const AABB_CUDA& aabb_update,
+            UpdateType* d_aabb_ptr);
+
+        /**
+         * @brief Updates the parameters of the map update kernel node in the executable graph.
+         * @param executable_graph The executable graph to update.
+         * @param aabb_update The per-frame AABB used for kernel execution.
+         * @param d_aabb_ptr Pointer to the device memory where the AABB grid is stored.
+         */
+        void update_insertion_graph_nodes(
+            cudaGraphExec_t executable_graph,
+            const AABB_CUDA& aabb_update,
+            UpdateType* d_aabb_ptr);
+
+
     private:
+        /**
+         * @brief Creates a new chunk map with the specified capacity.
+         * This function initializes a new chunk map with the given capacity and returns a unique pointer to it.
+         * @param capacity The number of max entries in the map.
+         * @return A unique pointer to the newly created ChunkMap.
+         */
+        std::unique_ptr<ChunkMap> create_chunk_map(size_t capacity);
+
         /**
          * @brief Helper function to retrieve all chunks from the hash map.
          * This function retrieves all chunk keys and their corresponding pointers from the hash map.
@@ -214,11 +315,18 @@ class GpuHashMap {
             const std::vector<ChunkPtr>& ptrs_to_deallocate);
 
         std::unique_ptr<ChunkMap> d_voxel_map_;
+        ChunkMapRef map_ref_insertion_;
+        ConstChunkMapRef map_ref_extraction_;
+
         VoxelType* global_memory_pool_ = nullptr;
         ChunkPtr* freelist_ = nullptr;
         uint32_t* freelist_counter_ = nullptr;
         uint32_t freelist_capacity_ = 0;
         size_t map_capacity_ = 0;
+
+        cudaGraphNode_t update_map_node_;
+        void* insertion_kernel_args_[6];
+
 };
 
 } // namespace voxel_mapping

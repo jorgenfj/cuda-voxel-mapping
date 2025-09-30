@@ -4,6 +4,7 @@
 #include "voxel-mapping/extraction_result.hpp"
 #include <cuda_runtime.h>
 #include <typeinfo>
+#include <memory>
 
 namespace voxel_mapping {
 
@@ -19,11 +20,10 @@ public:
 template<typename T>
 class ExtractionResultTyped : public ExtractionResultBase {
 public:
-    ~ExtractionResultTyped() {
-        if (event_) cudaEventDestroy(event_);
-        if (h_pinned_data_) cudaFreeHost(h_pinned_data_);
-        if (d_data_) cudaFree(d_data_);
-    }
+    ExtractionResultTyped(void* h_pinned_data, size_t size_bytes, cudaEvent_t event)
+        : h_pinned_data_(h_pinned_data), size_bytes_(size_bytes), event_(event) {}
+
+    ~ExtractionResultTyped() override = default; 
 
     void wait() override {
         if (event_) cudaEventSynchronize(event_);
@@ -32,10 +32,10 @@ public:
     size_t size_bytes() const override { return size_bytes_; }
     const std::type_info& type() const override { return typeid(T); }
 
+private:
     void* h_pinned_data_ = nullptr;
-    void* d_data_ = nullptr;
-    cudaEvent_t event_ = nullptr;
     size_t size_bytes_ = 0;
+    cudaEvent_t event_ = nullptr;
 };
 
 } // namespace voxel_mapping

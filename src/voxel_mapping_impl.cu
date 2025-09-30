@@ -7,7 +7,7 @@ namespace voxel_mapping {
 
 VoxelMappingImpl::VoxelMappingImpl(const VoxelMappingParams& params)
     : resolution_(params.resolution), occupancy_threshold_(params.occupancy_threshold),
-        free_threshold_(params.free_threshold)
+        free_threshold_(params.free_threshold), max_extraction_buffer_size_bytes_(params.max_extraction_buffer_size_bytes)
 {
     if (resolution_ <= 0) {
         throw std::invalid_argument("Resolution must be positive");
@@ -20,30 +20,69 @@ VoxelMappingImpl::VoxelMappingImpl(const VoxelMappingParams& params)
     spdlog::info("Update generator initialized with resolution: {}, min_depth: {}, max_depth: {}", resolution_, params.min_depth, params.max_depth);
     grid_processor_ = std::make_unique<GridProcessor>(params.occupancy_threshold, params.free_threshold, params.edt_max_distance);
     spdlog::info("Grid processor initialized with occupancy threshold: {}, free threshold: {}, EDT max distance: {}", params.occupancy_threshold, params.free_threshold, params.edt_max_distance);
+
+    size_t buffer_size = params.max_extraction_buffer_size_bytes;
+    CHECK_CUDA_ERROR(cudaMalloc(&extraction_buffer_.d_data, buffer_size));
+    CHECK_CUDA_ERROR(cudaHostAlloc(&extraction_buffer_.h_pinned_data, buffer_size, cudaHostAllocDefault));
+    CHECK_CUDA_ERROR(cudaEventCreate(&extraction_buffer_.event));
+    spdlog::info("Extraction buffer preallocated with a maximum size of {} bytes", buffer_size);
 }
 
 VoxelMappingImpl::~VoxelMappingImpl() {
     if (insert_stream_) cudaStreamDestroy(insert_stream_);
     if (extract_stream_) cudaStreamDestroy(extract_stream_);
+    if (insert_graph_is_initialized_) {
+        cudaGraphExecDestroy(insert_exec_graph_);
+        cudaGraphDestroy(insert_graph_);
+    }
+}
+
+void VoxelMappingImpl::setup_insert_graph(const float* depth_image, const float* transform) {
+    CHECK_CUDA_ERROR(cudaGraphCreate(&insert_graph_, 0));
+
+    std::vector<cudaGraphNode_t> dependencies;
+
+    update_generator_->compute_active_aabb(transform);
+    const AABB_CUDA& aabb_update = update_generator_->get_aabb_update_struct();
+    UpdateType* d_aabb_ptr = update_generator_->get_device_aabb_ptr();
+    dependencies = update_generator_->add_nodes_to_insertion_graph(insert_graph_, dependencies, aabb_update);
+
+    dependencies = voxel_map_->add_nodes_to_insertion_graph(
+        insert_graph_,
+        dependencies,
+        aabb_update,
+        d_aabb_ptr
+    );
+
+    CHECK_CUDA_ERROR(cudaGraphInstantiate(&insert_exec_graph_, insert_graph_, nullptr, nullptr, 0));
+    insert_graph_is_initialized_ = true;
 }
 
 void VoxelMappingImpl::integrate_depth(const float* depth_image, const float* transform) {
     #ifdef USE_NVTX
         nvtx3::scoped_range r{"Integrate Depth"};
     #endif
-    AABBUpdate aabb_update = update_generator_->generate_updates(
-        depth_image, 
-        transform,
-        insert_stream_
-    );
-    
-    {
-        std::shared_lock lock(map_mutex_);
-        voxel_map_->launch_map_update_kernel(
-            aabb_update,
-            insert_stream_
-        );
+    if (!insert_graph_is_initialized_) {
+        setup_insert_graph(depth_image, transform);
     }
+    
+    update_generator_->compute_active_aabb(transform);
+    const AABB_CUDA& aabb_update = update_generator_->get_aabb_update_struct();
+    UpdateType* d_aabb_ptr = update_generator_->get_device_aabb_ptr();
+    
+    float* h_pinned_depth = update_generator_->get_host_pinned_depth_ptr();
+    float* h_pinned_transform = update_generator_->get_host_pinned_transform_ptr();
+    memcpy(h_pinned_depth, depth_image, update_generator_->get_depth_buffer_size());
+    memcpy(h_pinned_transform, transform, 16 * sizeof(float));
+
+    update_generator_->update_insertion_graph_nodes(
+        insert_exec_graph_, aabb_update);
+
+    voxel_map_->update_insertion_graph_nodes(
+        insert_exec_graph_,
+        aabb_update, d_aabb_ptr);
+
+    CHECK_CUDA_ERROR(cudaGraphLaunch(insert_exec_graph_, insert_stream_));
 }
 
 void VoxelMappingImpl::set_camera_properties(float fx, float fy, float cx, float cy, uint32_t width, uint32_t height) {

@@ -65,7 +65,7 @@ __device__ inline float3 pixel_to_world_space(
  * @brief Traverses a ray from start to end, marking voxels in the AABB as Free.
  */
 __device__ inline void mark_ray_as_free(
-    const float3& start_point, const float3& end_point, UpdateType* d_aabb_3d,
+    const float3& start_point, const float3& end_point, UpdateType* d_aabb,
     const int3& min_aabb_index, const int3& aabb_current_size, float resolution)
 {
     float step_size = resolution * 0.5f;
@@ -87,7 +87,7 @@ __device__ inline void mark_ray_as_free(
 
         if (grid_x >= 0 && grid_x < aabb_current_size.x && grid_y >= 0 && grid_y < aabb_current_size.y && grid_z >= 0 && grid_z < aabb_current_size.z) {
             uint32_t idx = block_1d_index(grid_x, grid_y, grid_z, aabb_current_size.x, aabb_current_size.y);
-            d_aabb_3d[idx] = UpdateType::Free;
+            d_aabb[idx] = UpdateType::Free;
         }
     }
 }
@@ -96,7 +96,7 @@ __device__ inline void mark_ray_as_free(
  * @brief Marks the voxel at the ray's endpoint as Occupied.
  */
 __device__ inline void mark_endpoint_as_occupied(
-    const float3& world_point, UpdateType* d_aabb_3d, const int3& min_aabb_index,
+    const float3& world_point, UpdateType* d_aabb, const int3& min_aabb_index,
     const int3& aabb_current_size, float resolution)
 {
     int end_x = static_cast<int>(floorf(world_point.x / resolution)) - min_aabb_index.x;
@@ -105,7 +105,7 @@ __device__ inline void mark_endpoint_as_occupied(
 
     if (end_x >= 0 && end_x < aabb_current_size.x && end_y >= 0 && end_y < aabb_current_size.y && end_z >= 0 && end_z < aabb_current_size.z) {
         uint32_t idx = block_1d_index(end_x, end_y, end_z, aabb_current_size.x, aabb_current_size.y);
-        d_aabb_3d[idx] = UpdateType::Occupied;
+        d_aabb[idx] = UpdateType::Occupied;
     }
 }
 
