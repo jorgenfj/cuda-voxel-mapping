@@ -97,3 +97,26 @@ colcon build --symlink-install
 ```
 
 Colcon will automatically build `voxel_mapping` first, followed by your package, correctly linking them together.
+
+# Profiling
+
+The library is now highly optimized with CUDA graphs for asynchronous execution. The first image shows the host time for a map insertion with a max depth set to 10 m and resolution of 0.1 m, meaning this queries the raycasting and updates the relevant axis-aligned bounding box. The image shows that the host wait time to queue up an insertion is less than 1 ms.
+
+![Integrate depth kernel launch](docs/nx_integrate_depth_launch.png)
+
+After the host regains control, the device handles the asynchronous execution of the insertion graph in parallel while the host performs other tasks. The execution step of the graph can take around 11 ms.
+
+![Integrate depth kernel execution](docs/nx_integrate_depth_exec.png)
+
+This highlights the benefit of using CUDA graphs, where the computations are performed asynchronously so the host does not have to stand idle waiting for the expensive operations to complete.
+
+The host can also, in parallel, perform extractions from a desired 3D section of the voxel map. This operation is also split into two parts: a graph launch and an execution stage. This shows a CUDA graph launch time of 400 microseconds.
+
+
+![EDT block launch](docs/nx_edt_block_launch.png)
+
+The specified 3D section is then extracted from the map and a 3D Euclidean distance transform is performed in that space. This graph execution phase happens asynchronously on the device, freeing the host to perform other tasks while waiting for the result.
+
+![EDT block exec](docs/nx_edt_block_exec.png)
+
+All CUDA graphs are supported by pinned, page-locked host memory for minimum latency.
